@@ -1,0 +1,459 @@
+# Zama FHEVM Token Swap dApp (single-file preview)
+
+Phiên bản demo  **dApp swap token** rất nhẹ dùng cho môi trường EVM (có thể chạy trên FHEVM / Zama testnet nếu chain tương thích với RPC EVM).
+
+Nội dung chính:
+- Hợp đồng ERC20 mẫu (`Token.sol`) để test (mintable).
+- Hợp đồng AMM rất đơn giản (`SimpleAMM.sol`) theo cơ chế constant-product (x * y = k). Cho phép addLiquidity và swapExactInput.
+- Hardhat deploy script để triển khai token + pool.
+- Frontend React (`App.jsx`) cho phép kết nối ví, cấp phép (approve), thêm thanh khoản (option), và swap token A -> token B.
+
+
+---
+
+## 1) `contracts/Token.sol`
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+
+contract Token is ERC20, Ownable {
+    constructor(string memory name_, string memory symbol_) ERC20(name_, symbol_) {}
+
+    function mint(address to, uint256 amount) external onlyOwner {
+        _mint(to, amount);
+    }
+}
+```
+
+## 2) `contracts/SimpleAMM.sol`
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
+contract SimpleAMM {
+    IERC20 public tokenA;
+    IERC20 public tokenB;
+    uint256 public reserveA;
+    uint256 public reserveB;
+    uint256 public totalLiquidity;
+    mapping(address=>uint256) public liquidity;
+
+    event LiquidityAdded(address indexed provider, uint256 amountA, uint256 amountB, uint256 liquidityMinted);
+    event Swapped(address indexed trader, address tokenIn, uint256 amountIn, address tokenOut, uint256 amountOut);
+
+    constructor(address _tokenA, address _tokenB) {
+        tokenA = IERC20(_tokenA);
+        tokenB = IERC20(_tokenB);
+    }
+
+    function addLiquidity(uint256 amountA, uint256 amountB) external returns (uint256) {
+        require(amountA > 0 && amountB > 0, "invalid amounts");
+        require(tokenA.transferFrom(msg.sender, address(this), amountA), "transferA failed");
+        require(tokenB.transferFrom(msg.sender, address(this), amountB), "transferB failed");
+
+        uint256 liquidityMinted;
+        if (totalLiquidity == 0) {
+            liquidityMinted = sqrt(amountA * amountB);
+        } else {
+            uint256 liqA = (amountA * totalLiquidity) / reserveA;
+            uint256 liqB = (amountB * totalLiquidity) / reserveB;
+            liquidityMinted = liqA < liqB ? liqA : liqB;
+        }
+
+        require(liquidityMinted > 0, "insufficient liquidity minted");
+        liquidity[msg.sender] += liquidityMinted;
+        totalLiquidity += liquidityMinted;
+        reserveA += amountA;
+        reserveB += amountB;
+
+        emit LiquidityAdded(msg.sender, amountA, amountB, liquidityMinted);
+        return liquidityMinted;
+    }
+
+    function swapExactInput(address tokenIn, uint256 amountIn) external returns (uint256 amountOut) {
+        require(amountIn > 0, "amountIn 0");
+        bool inIsA = (tokenIn == address(tokenA));
+        require(inIsA || tokenIn == address(tokenB), "invalid tokenIn");
+
+        IERC20 inToken = inIsA ? tokenA : tokenB;
+        IERC20 outToken = inIsA ? tokenB : tokenA;
+        uint256 reserveIn = inIsA ? reserveA : reserveB;
+        uint256 reserveOut = inIsA ? reserveB : reserveA;
+
+        require(reserveIn > 0 && reserveOut > 0, "empty reserves");
+
+        require(inToken.transferFrom(msg.sender, address(this), amountIn), "transferFrom failed");
+
+        uint256 amountInWithFee = (amountIn * 997) / 1000;
+        amountOut = (amountInWithFee * reserveOut) / (reserveIn + amountInWithFee);
+        require(amountOut > 0, "insufficient output amount");
+
+        if (inIsA) {
+            reserveA += amountIn;
+            reserveB -= amountOut;
+        } else {
+            reserveB += amountIn;
+            reserveA -= amountOut;
+        }
+
+        require(outToken.transfer(msg.sender, amountOut), "transfer out failed");
+
+        emit Swapped(msg.sender, tokenIn, amountIn, address(outToken), amountOut);
+        return amountOut;
+    }
+
+    function sqrt(uint256 y) internal pure returns (uint256 z) {
+        if (y > 3) {
+            z = y;
+            uint256 x = y / 2 + 1;
+            while (x < z) {
+                z = x;
+                x = (y / x + x) / 2;
+            }
+        } else if (y != 0) {
+            z = 1;
+        }
+    }
+}
+```
+
+---
+
+## Hardhat config & deploy
+
+### `hardhat.config.js`
+```js
+require("dotenv").config();
+require("@nomiclabs/hardhat-ethers");
+
+module.exports = {
+  solidity: "0.8.19",
+  networks: {
+    fhevm_testnet: {
+      url: process.env.FHEVM_RPC_URL || "",
+      accounts: process.env.DEPLOYER_PRIVATE_KEY ? [process.env.DEPLOYER_PRIVATE_KEY] : [],
+      gas: "auto",
+    },
+  },
+};
+```
+
+### `scripts/deploy-swap.js`
+```js
+const hre = require('hardhat');
+
+async function main() {
+  const { ethers } = hre;
+  const [deployer] = await ethers.getSigners();
+  console.log('Deploying with', deployer.address);
+
+  const Token = await ethers.getContractFactory('Token');
+  const A = await Token.deploy('TokenA', 'TKA');
+  await A.deployed();
+  const B = await Token.deploy('TokenB', 'TKB');
+  await B.deployed();
+  console.log('TokenA', A.address, 'TokenB', B.address);
+
+  const parseUnits = ethers.utils.parseUnits;
+  await A.mint(deployer.address, parseUnits('1000000', 18));
+  await B.mint(deployer.address, parseUnits('1000000', 18));
+
+  const AMM = await ethers.getContractFactory('SimpleAMM');
+  const amm = await AMM.deploy(A.address, B.address);
+  await amm.deployed();
+  console.log('SimpleAMM', amm.address);
+
+  const amountA = parseUnits('10000', 18);
+  const amountB = parseUnits('5000', 18);
+  await A.approve(amm.address, amountA);
+  await B.approve(amm.address, amountB);
+  await amm.addLiquidity(amountA, amountB);
+
+  console.log('Initialized pool with liquidity');
+}
+
+main().catch((err)=>{ console.error(err); process.exitCode = 1; });
+```
+
+---
+
+## Frontend `frontend/src/App.jsx`
+```jsx
+import React, {useEffect, useState} from 'react';
+import {ethers} from 'ethers';
+
+const ERC20_ABI = [
+  'function approve(address spender, uint256 amount) external returns (bool)',
+  'function allowance(address owner, address spender) external view returns (uint256)',
+  'function balanceOf(address owner) external view returns (uint256)',
+  'function decimals() view returns (uint8)'
+];
+
+const AMM_ABI = [
+  'function addLiquidity(uint256 amountA, uint256 amountB) external returns (uint256)',
+  'function swapExactInput(address tokenIn, uint256 amountIn) external returns (uint256)'
+];
+
+export default function App(){
+  const [provider, setProvider] = useState(null);
+  const [signer, setSigner] = useState(null);
+  const [account, setAccount] = useState(null);
+
+  const [tokenAAddr, setTokenAAddr] = useState('');
+  const [tokenBAddr, setTokenBAddr] = useState('');
+  const [ammAddr, setAmmAddr] = useState('');
+
+  const [amountIn, setAmountIn] = useState('');
+  const [status, setStatus] = useState('idle');
+  const [balanceA, setBalanceA] = useState('0');
+  const [balanceB, setBalanceB] = useState('0');
+
+  useEffect(()=>{
+    if(window.ethereum) setProvider(new ethers.BrowserProvider(window.ethereum));
+  },[]);
+
+  async function connect(){
+    if(!provider){ setStatus('No wallet'); return; }
+    await provider.send('eth_requestAccounts', []);
+    const s = await provider.getSigner();
+    setSigner(s);
+    const a = await s.getAddress();
+    setAccount(a);
+    setStatus('Wallet connected: ' + a);
+  }
+
+  async function refreshBalances(){
+    if(!signer || !tokenAAddr || !tokenBAddr || !account) return;
+    try{
+      const a = new ethers.Contract(tokenAAddr, ERC20_ABI, signer);
+      const b = new ethers.Contract(tokenBAddr, ERC20_ABI, signer);
+      const decA = await a.decimals();
+      const decB = await b.decimals();
+      const balA = await a.balanceOf(account);
+      const balB = await b.balanceOf(account);
+      setBalanceA(ethers.formatUnits(balA, decA));
+      setBalanceB(ethers.formatUnits(balB, decB));
+    }catch(e){ console.error(e); }
+  }
+
+  async function ensureApprove(tokenAddr, spender, amount){
+    const token = new ethers.Contract(tokenAddr, ERC20_ABI, signer);
+    const dec = await token.decimals();
+    const amt = ethers.parseUnits(amount, dec);
+    const allowance = await token.allowance(account, spender);
+    if(allowance < amt){
+      setStatus('Approving...');
+      const tx = await token.approve(spender, amt);
+      await tx.wait();
+      setStatus('Approved');
+    }
+  }
+
+  async function doSwap(){
+    if(!signer || !ammAddr || !tokenAAddr) { setStatus('Set addresses and connect wallet'); return; }
+    try{
+      setStatus('Preparing swap');
+      const amm = new ethers.Contract(ammAddr, AMM_ABI, signer);
+      await ensureApprove(tokenAAddr, ammAddr, amountIn);
+      const token = new ethers.Contract(tokenAAddr, ERC20_ABI, signer);
+      const dec = await token.decimals();
+      const amt = ethers.parseUnits(amountIn, dec);
+      setStatus('Sending swap tx...');
+      const tx = await amm.swapExactInput(tokenAAddr, amt);
+      await tx.wait();
+      setStatus('Swap executed');
+      await refreshBalances();
+    }catch(e){ setStatus('Swap error: ' + (e.message || e)); }
+  }
+
+  return (
+    <div className="p-6">
+      <h1 className="text-2xl mb-4">Swap dApp (SimpleAMM)</h1>
+      <div className="mb-3">
+        <button onClick={connect} className="p-2 border mr-2">Connect Wallet</button>
+        <button onClick={refreshBalances} className="p-2 border">Refresh Balances</button>
+      </div>
+
+      <div className="mb-3">
+        <label>Token A address:</label>
+        <input value={tokenAAddr} onChange={(e)=>setTokenAAddr(e.target.value)} className="ml-2 p-1 border" />
+      </div>
+      <div className="mb-3">
+        <label>Token B address:</label>
+        <input value={tokenBAddr} onChange={(e)=>setTokenBAddr(e.target.value)} className="ml-2 p-1 border" />
+      </div>
+      <div className="mb-3">
+        <label>AMM contract address:</label>
+        <input value={ammAddr} onChange={(e)=>setAmmAddr(e.target.value)} className="ml-2 p-1 border" />
+      </div>
+
+      <div className="mb-3">
+        <label>Amount in (Token A):</label>
+        <input value={amountIn} onChange={(e)=>setAmountIn(e.target.value)} className="ml-2 p-1 border" />
+        <button onClick={doSwap} className="ml-2 p-2 border">Swap</button>
+      </div>
+
+      <div className="mb-3">
+        <div>Balance A: {balanceA}</div>
+        <div>Balance B: {balanceB}</div>
+      </div>
+
+      <div className="mt-4 text-sm">Status: {status}</div>
+    </div>
+  );
+}
+```
+
+---
+
+
+---
+
+## Zama FHE Integration (concrete integration files)
+
+Install suggested packages:
+
+```bash
+npm install @zama/tfhe-sdk cross-fetch
+```
+
+### `frontend/src/fhe/tfheAdapter.js`
+```js
+// Minimal TFHE adapter for browser usage (uses hypothetical @zama/tfhe-sdk API)
+import { TFHE } from '@zama/tfhe-sdk';
+
+export async function initTFHE() {
+  if (!TFHE.isReady) await TFHE.ready();
+}
+
+export function generateKeypair() {
+  return TFHE.generateKeypair();
+}
+
+export function encryptNumber(publicKey, num, options = { precision: 6 }) {
+  const fixed = TFHE.encodeFixedPoint(num, options.precision);
+  return TFHE.encrypt(publicKey, fixed);
+}
+
+export function decryptNumber(secretKey, cipher, options = { precision: 6 }) {
+  const fixed = TFHE.decrypt(secretKey, cipher);
+  return TFHE.decodeFixedPoint(fixed, options.precision);
+}
+
+export function cipherToBytes(cipher) {
+  return TFHE.serialize(cipher);
+}
+
+export function cipherFromBytes(bytes) {
+  return TFHE.deserialize(bytes);
+}
+```
+
+### `frontend/src/fhe/relayerClient.js`
+```js
+import fetch from 'cross-fetch';
+
+const RELAYER_BASE = process.env.REACT_APP_RELAYER_URL || 'https://relayer.example';
+
+export async function registerInput({ contract, inputBytes, meta = {} }) {
+  const res = await fetch(RELAYER_BASE + '/register', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ contract, input: Array.from(inputBytes), meta })
+  });
+  if (!res.ok) throw new Error('register failed');
+  return res.json();
+}
+
+export async function requestComputation({ registrationId, operation, params = {} }) {
+  const res = await fetch(RELAYER_BASE + '/compute', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ registrationId, operation, params })
+  });
+  if (!res.ok) throw new Error('compute request failed');
+  return res.json();
+}
+
+export async function getResult(jobId) {
+  const res = await fetch(RELAYER_BASE + `/result/${jobId}`);
+  if (!res.ok) throw new Error('getResult failed');
+  const payload = await res.json();
+  return new Uint8Array(payload.result);
+}
+```
+
+### Frontend integration (use these functions in `App.jsx` to show estimate)
+
+```js
+import { initTFHE, generateKeypair, encryptNumber, decryptNumber, cipherToBytes, cipherFromBytes } from './fhe/tfheAdapter';
+import { registerInput, requestComputation, getResult } from './fhe/relayerClient';
+
+let LOCAL_KEYPAIR = null; // store in-memory for the session
+
+async function ensureKeys() {
+  if (!LOCAL_KEYPAIR) {
+    await initTFHE();
+    LOCAL_KEYPAIR = generateKeypair();
+  }
+  return LOCAL_KEYPAIR;
+}
+
+export async function estimateAmountOutEncrypted(amountPlain, tokenInAddr) {
+  const kp = await ensureKeys();
+  const cipher = encryptNumber(kp.publicKey, Number(amountPlain));
+  const bytes = cipherToBytes(cipher);
+  const registration = await registerInput({ contract: process.env.REACT_APP_AMM_ADDRESS, inputBytes: bytes, meta: { purpose: 'estimate_swap' } });
+  const job = await requestComputation({ registrationId: registration.id, operation: 'estimate_swap', params: { tokenIn: tokenInAddr } });
+  const resultBytes = await getResult(job.id);
+  const resultCipher = cipherFromBytes(resultBytes);
+  const amountOut = decryptNumber(kp.secretKey, resultCipher);
+  return amountOut;
+}
+```
+
+### How to call from `App.jsx`
+
+1. Import `estimateAmountOutEncrypted`.
+2. When user types `amountIn`, call it (debounced) to get `amountOut` and update UI.
+3. Use returned `amountOut` to compute slippage and populate the Swap Preview.
+
+Example (pseudo-integration inside `App.jsx`):
+
+```js
+// inside component
+import { estimateAmountOutEncrypted } from './fhe/estimate';
+
+async function onAmountInChange(val) {
+  setAmountIn(val);
+  try {
+    setStatus('Estimating...');
+    const estimatedOut = await estimateAmountOutEncrypted(val, tokenAAddr);
+    setEstimatedOut(String(estimatedOut));
+    setStatus('Estimate ready');
+  } catch (e) {
+    setStatus('Estimate failed: ' + e.message);
+  }
+}
+```
+
+### Relayer server responsibilities (summary)
+
+- Accept registration of encrypted inputs from users.
+- Run the homomorphic `estimate_swap` job using TFHE runtimes (or native Zama relayer APIs).
+- Publish result ciphertexts for the user's job id.
+- Ensure authentication / rate-limiting and do not request secret keys from users.
+
+### Important cautions
+
+- This integration uses hypothetical SDK function names and a minimal relayer API. Replace imports and function names with the exact APIs from Zama / TFHE SDK documentation.
+- Encode fixed-point precision consistently between client and relayer.
+- Never transmit secret keys to the relayer or on-chain.
+
+---
+
